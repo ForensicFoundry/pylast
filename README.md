@@ -2,7 +2,7 @@
 
 A zero-dependency, single-file Python tool for parsing Linux authentication artifacts in digital forensics investigations.
 
-Modern Linux distributions (Debian 13+, Ubuntu 25.04+) have replaced the legacy `last` binary with `wtmpdb`, a SQLite-based login tracking system. Forensic examiners working with disk images from both legacy and modern systems no longer have a single tool that handles all login record formats. **pylast** fills that gap.
+Modern Linux distributions (Debian 13+, Ubuntu 25.04+, etc) have replaced the legacy `last` binary with `wtmpdb`, a SQLite-based login tracking system. Forensic examiners working with disk images from both legacy and modern systems no longer have a single tool that handles all login record formats. **pylast** fills that gap.
 
 ## Features
 
@@ -20,7 +20,7 @@ Modern Linux distributions (Debian 13+, Ubuntu 25.04+) have replaced the legacy 
 | Flag | Source | Description |
 |------|--------|-------------|
 | `-f` | wtmp / btmp / utmp | Legacy 384-byte binary login records (including `.gz`) |
-| `-f` | wtmp.db | SQLite-based wtmpdb (Debian 13+, Ubuntu 25.04+) |
+| `-f` | wtmp.db | SQLite-based wtmpdb |
 | `-a` | auth.log | Syslog authentication logs, including `.gz` rotated files |
 | `-j` | journal directory | Systemd binary journal files (parsed via `journalctl`) |
 
@@ -62,7 +62,7 @@ pylast -f /evidence/wtmp
 # Parse btmp (failed logins) from multiple files
 pylast -f /evidence/btmp.0 /evidence/btmp.1
 
-# Parse a wtmpdb
+# Parse a wtmpdb from modern distributions using systemd-logind
 pylast -f /evidence/wtmp.db
 
 # Parse auth.log files (including gzip-compressed rotated logs)
