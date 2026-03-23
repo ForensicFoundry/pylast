@@ -1,0 +1,1443 @@
+#!/usr/bin/env python3
+"""
+Name:    pylast
+Title:   Linux Authentication Artifact Parser
+Purpose: Parse login records from wtmp/btmp/utmp, auth logs, and
+         systemd journal for digital forensics.
+Usage:   pylast [options]
+Options:
+  -h, --help              show this help message and exit
+  -v, --version           show version information and exit
+  -f, --file FILE         parse wtmp, btmp, utmp, or wtmpdb file(s), including .gz
+  -a, --auth FILE         parse auth.log file(s), including .gz compressed
+  -j, --journal DIR       parse a systemd journal directory (requires journalctl)
+  -t                      output as tab-separated values with a header row
+  -s, --sqlite FILE       write results to a SQLite database (mutually exclusive with -t)
+  --all                   show all record types (only affects -f)
+Requires: Python 3.11+
+Exit codes: 0 - Success, 1 - Error
+Version: 26.03.01
+Author:  Forensic Foundry
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import struct
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except AttributeError:
+    pass
+
+
+def _doc_field(field: str) -> str:
+    """Extract a metadata field from the module docstring."""
+    m = re.search(rf"^{field}:\s*(.+)$", __doc__ or "", re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+PROG = _doc_field("Name") or "pylast"
+TITLE = _doc_field("Title") or ""
+VERSION = _doc_field("Version") or "0.0.0"
+
+# ---------------------------------------------------------------------------
+# Format keys
+# ---------------------------------------------------------------------------
+
+FMT_LEGACY_WTMP = "legacy_wtmp"
+FMT_LEGACY_BTMP = "legacy_btmp"
+FMT_WTMPDB = "wtmpdb"
+FMT_AUTH = "auth"
+FMT_JOURNAL = "journal"
+
+FORMAT_LABELS = {
+    FMT_LEGACY_WTMP: "legacy wtmp",
+    FMT_LEGACY_BTMP: "legacy btmp",
+    FMT_WTMPDB: "wtmpdb",
+    FMT_AUTH: "auth.log",
+    FMT_JOURNAL: "journal",
+}
+
+# ---------------------------------------------------------------------------
+# Legacy utmp binary constants
+# ---------------------------------------------------------------------------
+
+UTMP_STRUCT_FORMAT = "<hxxi32s4s32s256shhiii4I20s"
+UTMP_STRUCT_SIZE = struct.calcsize(UTMP_STRUCT_FORMAT)
+
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+LEGACY_TYPE_NAMES = {
+    0: "EMPTY",
+    1: "RUN_LVL",
+    2: "BOOT_TIME",
+    3: "NEW_TIME",
+    4: "OLD_TIME",
+    5: "INIT_PROCESS",
+    6: "LOGIN_PROCESS",
+    7: "USER_PROCESS",
+    8: "DEAD_PROCESS",
+    9: "ACCOUNTING",
+}
+
+LEGACY_WTMP_DEFAULT_TYPES = {1, 2, 7}
+
+# ---------------------------------------------------------------------------
+# wtmpdb constants
+# ---------------------------------------------------------------------------
+
+WTMPDB_TYPE_NAMES = {
+    0: "EMPTY",
+    1: "BOOT_TIME",
+    2: "RUN_LVL",
+    3: "USER_PROCESS",
+}
+
+WTMPDB_DEFAULT_TYPES = {1, 3}
+
+# ---------------------------------------------------------------------------
+# Auth / journal event patterns
+# ---------------------------------------------------------------------------
+
+_RE_SYSLOG_LINE = re.compile(r"^(\S+)\s+(\S+)\s+(.*)")
+
+_RE_SSH_ACCEPTED = re.compile(
+    r"sshd(?:-session)?\[(\d+)\]:\s*Accepted\s+(\S+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)"
+)
+_RE_SSH_FAILED = re.compile(
+    r"sshd(?:-session)?\[(\d+)\]:\s*Failed\s+password\s+for\s+(?:invalid\s+user\s+)?(\S+)\s+from\s+(\S+)\s+port\s+(\d+)"
+)
+_RE_AUTH_FAILURE = re.compile(
+    r"pam_unix\(([^)]+):auth\):\s*authentication\s+failure;(.*)"
+)
+_RE_SUDO_CMD = re.compile(
+    r"sudo:\s+(\S+)\s+:\s+TTY=(\S+)\s*;\s*PWD=([^;]*?)\s*;\s*USER=(\S+)\s*;\s*COMMAND=(.*)"
+)
+_RE_SUDO_DENIED = re.compile(
+    r"sudo:\s+(\S+)\s+:\s+user\s+NOT\s+in\s+sudoers\s*;\s*TTY=(\S+)\s*;\s*PWD=([^;]*?)\s*;\s*USER=(\S+)\s*;\s*COMMAND=(.*)"
+)
+_RE_SUDO_AUTH_FAIL = re.compile(
+    r"sudo:\s+pam_unix\(sudo:auth\):\s*authentication\s+failure;(.*)"
+)
+_RE_SU_OPEN = re.compile(
+    r"su\[?(\d*)\]?:\s*pam_unix\(su[-l]*:session\):\s*session\s+opened\s+for\s+user\s+(\S+).*?by\s+(\S+)"
+)
+_RE_SU_FAILED = re.compile(
+    r"su\[?(\d*)\]?:\s*FAILED\s+su\s+for\s+(\S+)\s+by\s+(\S+)"
+)
+
+def _strip_uid_suffix(name):
+    """Strip trailing (uid=N) from a username captured by PAM regexes."""
+    idx = name.find("(uid=")
+    return name[:idx] if idx > 0 else name
+
+# ---------------------------------------------------------------------------
+# Column definitions per format - (header, record_key, min_width)
+# ---------------------------------------------------------------------------
+
+WTMP_COLUMNS = [
+    ("Type", "type_name", 14),
+    ("PID", "pid", 7),
+    ("User", "user", 12),
+    ("TTY", "line", 14),
+    ("TID", "id", 5),
+    ("Host", "host", 20),
+    ("IP", "ip", 15),
+    ("Timestamp", "timestamp_str", 26),
+    ("Logout", "logout_str", 26),
+    ("Duration", "duration_str", 16),
+    ("ExitStatus", "e_term", 10),
+    ("ExitCode", "e_exit", 8),
+    ("SessionID", "session", 9),
+    ("Source", "source", 0),
+]
+
+BTMP_COLUMNS = [
+    ("Type", "type_name", 14),
+    ("PID", "pid", 7),
+    ("User", "user", 12),
+    ("TTY", "line", 14),
+    ("TID", "id", 5),
+    ("Host", "host", 20),
+    ("IP", "ip", 15),
+    ("Timestamp", "timestamp_str", 26),
+    ("ExitStatus", "e_term", 10),
+    ("ExitCode", "e_exit", 8),
+    ("SessionID", "session", 9),
+    ("Source", "source", 0),
+]
+
+WTMPDB_COLUMNS = [
+    ("Type", "type_name", 14),
+    ("User", "user", 12),
+    ("Login", "login_str", 26),
+    ("Logout", "logout_str", 26),
+    ("Duration", "duration_str", 16),
+    ("TTY", "tty", 14),
+    ("RemoteHost", "remote_host", 20),
+    ("Service", "service", 24),
+    ("Source", "source", 0),
+]
+
+AUTH_COLUMNS = [
+    ("Timestamp", "timestamp_str", 26),
+    ("Hostname", "hostname", 16),
+    ("Event", "event", 22),
+    ("User", "user", 12),
+    ("TargetUser", "target_user", 12),
+    ("RemoteIP", "remote_ip", 15),
+    ("Port", "port", 6),
+    ("TTY", "tty", 10),
+    ("Command", "command", 30),
+    ("PID", "pid", 8),
+    ("Service", "service", 16),
+    ("Source", "source", 0),
+]
+
+FORMAT_COLUMNS = {
+    FMT_LEGACY_WTMP: WTMP_COLUMNS,
+    FMT_LEGACY_BTMP: BTMP_COLUMNS,
+    FMT_WTMPDB: WTMPDB_COLUMNS,
+    FMT_AUTH: AUTH_COLUMNS,
+    FMT_JOURNAL: AUTH_COLUMNS,
+}
+
+FORMAT_TABLE_NAMES = {
+    FMT_LEGACY_WTMP: "wtmp_log",
+    FMT_LEGACY_BTMP: "btmp_log",
+    FMT_WTMPDB: "wtmpdb_log",
+    FMT_AUTH: "auth_log",
+    FMT_JOURNAL: "journal_log",
+}
+
+INTEGER_RECORD_KEYS = {
+    "pid", "type", "e_term", "e_exit", "session", "tv_sec", "tv_usec",
+    "login_us", "sort_us", "port",
+}
+
+FORMAT_TYPE_LABELS = {
+    FMT_LEGACY_WTMP: "legacy wtmp",
+    FMT_LEGACY_BTMP: "legacy btmp",
+    FMT_WTMPDB: "wtmpdb",
+    FMT_AUTH: "auth logs",
+    FMT_JOURNAL: "journal",
+}
+
+# ---------------------------------------------------------------------------
+# ANSI colors
+# ---------------------------------------------------------------------------
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "gray": "\033[90m",
+    "bold_red": "\033[1;31m",
+    "bold_green": "\033[1;32m",
+    "bold_yellow": "\033[1;33m",
+    "bold_cyan": "\033[1;36m",
+    "bold_magenta": "\033[1;35m",
+}
+
+LEGACY_WTMP_TYPE_COLORS = {
+    0: "gray",
+    1: "cyan",
+    2: "bold_green",
+    3: "blue",
+    4: "blue",
+    5: "magenta",
+    6: "yellow",
+    7: None,
+    8: "gray",
+    9: "gray",
+}
+
+WTMPDB_TYPE_COLORS = {
+    0: "gray",
+    1: "bold_green",
+    2: "cyan",
+    3: None,
+}
+
+AUTH_EVENT_COLORS = {
+    "SSH Login": "bold_green",
+    "SSH Failed Login": "red",
+    "Auth Failure": "red",
+    "Sudo Command": "cyan",
+    "Sudo Denied": "bold_red",
+    "Sudo Auth Failure": "bold_red",
+    "Su Login": "yellow",
+    "Su Failed": "bold_red",
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _color(text, style, use_color):
+    if not use_color or not style:
+        return str(text)
+    code = ANSI.get(style)
+    if not code:
+        return str(text)
+    return f"{code}{text}{ANSI['reset']}"
+
+
+def _msg(text, style, use_color, *, file=None):
+    """Print a styled message preceded by a blank line."""
+    dest = file or sys.stdout
+    print(f"\n{_color(text, style, use_color)}", file=dest)
+
+
+# ---------------------------------------------------------------------------
+# Custom argparse classes
+# ---------------------------------------------------------------------------
+
+class _VersionAction(argparse.Action):
+    """Colorized version output with a leading blank line."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, **kwargs):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         default=default, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        use_color = sys.stdout.isatty()
+        name = _color(PROG, "bold", use_color)
+        title = _color(f"-- {TITLE}", "gray", use_color) if TITLE else ""
+        ver = _color(VERSION, "bold_cyan", use_color)
+        line1 = f"{name} {title}" if title else name
+        print(f"\n{line1}\nVersion: {ver}")
+        parser.exit()
+
+
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser with colorized help and no usage in --help."""
+
+    def format_help(self):
+        use_color = sys.stdout.isatty()
+
+        def cb(t):
+            return _color(t, "bold", use_color)
+
+        def cg(t):
+            return _color(t, "gray", use_color)
+
+        def cc(t):
+            return _color(t, "bold_cyan", use_color)
+
+        def cgr(t):
+            return _color(t, "green", use_color)
+
+        def cy(t):
+            return _color(t, "bold_yellow", use_color)
+
+        gf, ga, gj = cgr("-f"), cgr("-a"), cgr("-j")
+        gs, gt = cgr("-s"), cgr("-t")
+
+        lines = [
+            f"{cb(PROG)} {cg('-- ' + TITLE) if TITLE else ''}",
+            f"Version: {cc(VERSION)}",
+            "",
+            "Digital forensics tool for parsing Linux login records.",
+            "",
+            cb("Supports:"),
+            f"  {gf}   Legacy wtmp/btmp/utmp binary files (x86_64, x86, ARM),",
+            "       including .gz compressed. Also supports wtmpdb (SQLite).",
+            f"  {ga}   Auth log files (auth.log, including .gz compressed).",
+            "       Extracts SSH logins/failures, auth failures, sudo, and su.",
+            f"  {gj}   Systemd journal directories (requires journalctl).",
+            f"       Extracts the same events as {ga} from binary journal files.",
+            "",
+            f"Only one of {gf}, {ga}, or {gj} may be used per invocation.",
+            f"Use {gs} to write results to a SQLite database"
+            f" (mutually exclusive with {gt}).",
+            f"When {gs} is used, SHA-256 hashes of source files are recorded in the pylast_log table (pre- and post-parse).",
+            f"For journal directories ({gj}), the hash is computed over all *.journal files sorted by path and concatenated.",
+            cc("To verify:  find DIR -name '*.journal' -print0 | sort -z | xargs -0 cat | sha256sum"),
+            "",
+            cy("All timestamps are displayed in UTC."),
+        ]
+        desc = "\n".join(lines) + "\n"
+
+        formatter = self._get_formatter()
+        for action_group in self._action_groups:
+            formatter.start_section(action_group.title)
+            formatter.add_arguments(action_group._group_actions)
+            formatter.end_section()
+        options_text = "\n" + formatter.format_help()
+        options_text = options_text.replace("options:", cb("Options:"), 1)
+
+        examples = "\n".join([
+            "",
+            cb("Examples:"),
+            f"  {PROG} -f /evidence/wtmp",
+            f"  {PROG} -f /evidence/wtmp --all",
+            f"  {PROG} -f /evidence/btmp.0 /evidence/btmp.1",
+            f"  {PROG} -a /evidence/auth.log /evidence/auth.log.1",
+            f"  {PROG} -a /evidence/auth.log*",
+            f"  {PROG} -j /evidence/journal/",
+            f"  {PROG} -f /evidence/wtmp -t > timeline.tsv",
+            f"  {PROG} -a /evidence/auth.log* -s endpoint.db",
+            "",
+        ])
+
+        return "\n" + desc + options_text + examples
+
+    def error(self, message):
+        use_color = sys.stderr.isatty()
+        print(file=sys.stderr)
+        self.print_usage(sys.stderr)
+        _msg(f"{self.prog}: error: {message}", "bold_red", use_color,
+             file=sys.stderr)
+        self.exit(2)
+
+
+def _decode_cstring(raw):
+    try:
+        idx = raw.index(b"\x00")
+        return raw[:idx].decode("utf-8", errors="replace")
+    except ValueError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _format_ip(addr_v6):
+    a, b, c, d = addr_v6
+    if b == 0 and c == 0 and d == 0:
+        if a == 0:
+            return "0.0.0.0"
+        raw = struct.pack("<I", a)
+        return f"{raw[0]}.{raw[1]}.{raw[2]}.{raw[3]}"
+    raw = struct.pack("<4I", a, b, c, d)
+    try:
+        return str(ipaddress.IPv6Address(raw))
+    except Exception:
+        return ":".join(f"{raw[i]:02x}{raw[i+1]:02x}" for i in range(0, 16, 2))
+
+
+def _format_timestamp(tv_sec, tv_usec):
+    if tv_sec == 0 and tv_usec == 0:
+        return ""
+    dt = datetime.fromtimestamp(tv_sec, tz=timezone.utc)
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{tv_usec:06d}"
+
+
+def _format_timestamp_us(us):
+    """Format a microsecond-epoch timestamp (used by wtmpdb)."""
+    if not us:
+        return ""
+    sec = us // 1_000_000
+    usec = us % 1_000_000
+    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{usec:06d}"
+
+
+def _iso_to_utc_str(iso_str):
+    """Parse an ISO 8601 timestamp with timezone and return UTC string."""
+    dt = datetime.fromisoformat(iso_str)
+    dt_utc = dt.astimezone(timezone.utc)
+    return f"{dt_utc.strftime('%Y-%m-%d %H:%M:%S')}.{dt_utc.microsecond:06d}"
+
+
+def _iso_to_epoch_us(iso_str):
+    """Parse an ISO 8601 timestamp and return microseconds since epoch (UTC)."""
+    dt = datetime.fromisoformat(iso_str)
+    dt_utc = dt.astimezone(timezone.utc)
+    return int(dt_utc.timestamp() * 1_000_000) + dt_utc.microsecond % 1_000_000
+
+
+def _format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return ""
+    total = int(seconds)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
+def _open_log_file(filepath):
+    """Open a plain text or .gz log file for reading."""
+    if filepath.endswith(".gz"):
+        return gzip.open(filepath, "rt", encoding="utf-8", errors="replace")
+    return open(filepath, encoding="utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Legacy binary parsing
+# ---------------------------------------------------------------------------
+
+def _parse_legacy_record(data):
+    fields = struct.unpack(UTMP_STRUCT_FORMAT, data)
+    ut_type = fields[0]
+    addr = (fields[11], fields[12], fields[13], fields[14])
+    return {
+        "type": ut_type,
+        "type_name": LEGACY_TYPE_NAMES.get(ut_type, f"UNKNOWN({ut_type})"),
+        "pid": fields[1],
+        "user": _decode_cstring(fields[4]),
+        "line": _decode_cstring(fields[2]),
+        "id": _decode_cstring(fields[3]),
+        "host": _decode_cstring(fields[5]),
+        "ip": _format_ip(addr),
+        "tv_sec": fields[9],
+        "tv_usec": fields[10],
+        "timestamp_str": _format_timestamp(fields[9], fields[10]),
+        "e_term": fields[6],
+        "e_exit": fields[7],
+        "session": fields[8],
+        "logout_str": "",
+        "duration_str": "",
+        "source": "",
+    }
+
+
+def _open_binary_file(filepath):
+    """Open a binary file for reading, transparently handling .gz."""
+    if filepath.endswith(".gz"):
+        return gzip.open(filepath, "rb")
+    return open(filepath, "rb")
+
+
+def _parse_legacy_file(filepath):
+    records = []
+    with _open_binary_file(filepath) as f:
+        while True:
+            data = f.read(UTMP_STRUCT_SIZE)
+            if len(data) < UTMP_STRUCT_SIZE:
+                break
+            records.append(_parse_legacy_record(data))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# wtmpdb (SQLite) parsing
+# ---------------------------------------------------------------------------
+
+def _parse_wtmpdb_file(filepath):
+    """Parse a wtmpdb SQLite database. Returns list of record dicts."""
+    conn = sqlite3.connect(f"file:{filepath}?mode=ro", uri=True)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT ID, Type, User, Login, Logout, TTY, RemoteHost, Service FROM wtmp")
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        raise ValueError(f"Failed to query wtmpdb: {exc}") from exc
+    conn.close()
+
+    records = []
+    for row in rows:
+        db_id, db_type, user, login_us, logout_us, tty, remote_host, service = row
+
+        type_name = WTMPDB_TYPE_NAMES.get(db_type, f"UNKNOWN({db_type})")
+
+        login_str = _format_timestamp_us(login_us)
+
+        if logout_us:
+            logout_str = _format_timestamp_us(logout_us)
+            duration_sec = (logout_us - login_us) / 1_000_000
+            duration_str = _format_duration(duration_sec)
+        else:
+            if db_type == 1:
+                logout_str = "still running"
+            else:
+                logout_str = "still logged in"
+            duration_str = ""
+
+        records.append({
+            "type": db_type,
+            "type_name": type_name,
+            "user": user or "",
+            "login_us": login_us or 0,
+            "login_str": login_str,
+            "logout_str": logout_str,
+            "duration_str": duration_str,
+            "tty": tty or "",
+            "remote_host": remote_host or "",
+            "service": service or "",
+            "source": "",
+        })
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Auth.log parsing
+# ---------------------------------------------------------------------------
+
+def _make_auth_record(timestamp_str, sort_us, hostname, event, user,
+                      target_user, remote_ip, port, tty, command, pid,
+                      service, source):
+    return {
+        "timestamp_str": timestamp_str,
+        "sort_us": sort_us,
+        "hostname": hostname,
+        "event": event,
+        "user": user,
+        "target_user": target_user,
+        "remote_ip": remote_ip,
+        "port": port,
+        "tty": tty,
+        "command": command,
+        "pid": pid,
+        "service": service,
+        "source": source,
+    }
+
+
+def _extract_kv(text, key):
+    """Extract value for key= from a space/semicolon-separated string."""
+    m = re.search(rf"(?:^|[\s;]){key}=(\S*)", text)
+    return m.group(1) if m else ""
+
+
+def _parse_auth_message(message, timestamp_str, sort_us, hostname, source):
+    """Try to match a syslog message against known auth event patterns.
+    Returns a record dict or None.
+    """
+    m = _RE_SSH_ACCEPTED.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "SSH Login",
+            m.group(3), "", m.group(4), m.group(5), "", "",
+            m.group(1), "sshd", source,
+        )
+
+    m = _RE_SSH_FAILED.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "SSH Failed Login",
+            m.group(2), "", m.group(3), m.group(4), "", "",
+            m.group(1), "sshd", source,
+        )
+
+    m = _RE_SUDO_DENIED.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Sudo Denied",
+            m.group(1), m.group(4), "", "", m.group(2), m.group(5).strip(),
+            "", "sudo", source,
+        )
+
+    m = _RE_SUDO_CMD.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Sudo Command",
+            m.group(1), m.group(4), "", "", m.group(2), m.group(5).strip(),
+            "", "sudo", source,
+        )
+
+    m = _RE_SUDO_AUTH_FAIL.search(message)
+    if m:
+        kv = m.group(1)
+        user = _extract_kv(kv, "user") or _extract_kv(kv, "logname")
+        tty = _extract_kv(kv, "tty")
+        rhost = _extract_kv(kv, "rhost")
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Sudo Auth Failure",
+            user, "", rhost, "", tty, "", "", "sudo", source,
+        )
+
+    m = _RE_AUTH_FAILURE.search(message)
+    if m:
+        pam_service = m.group(1)
+        kv = m.group(2)
+        user = _extract_kv(kv, "user") or _extract_kv(kv, "logname")
+        tty = _extract_kv(kv, "tty")
+        rhost = _extract_kv(kv, "rhost")
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Auth Failure",
+            user, "", rhost, "", tty, "", "", pam_service, source,
+        )
+
+    m = _RE_SU_OPEN.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Su Login",
+            _strip_uid_suffix(m.group(3)), _strip_uid_suffix(m.group(2)),
+            "", "", "", "",
+            m.group(1), "su", source,
+        )
+
+    m = _RE_SU_FAILED.search(message)
+    if m:
+        return _make_auth_record(
+            timestamp_str, sort_us, hostname, "Su Failed",
+            _strip_uid_suffix(m.group(3)), _strip_uid_suffix(m.group(2)),
+            "", "", "", "",
+            m.group(1), "su", source,
+        )
+
+    return None
+
+
+def _parse_auth_file(filepath):
+    """Parse a single auth.log file (plain or .gz). Returns list of records."""
+    records = []
+    with _open_log_file(filepath) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            m = _RE_SYSLOG_LINE.match(line)
+            if not m:
+                continue
+            ts_raw, hostname, rest = m.group(1), m.group(2), m.group(3)
+            try:
+                timestamp_str = _iso_to_utc_str(ts_raw)
+                sort_us = _iso_to_epoch_us(ts_raw)
+            except (ValueError, OSError):
+                continue
+            rec = _parse_auth_message(rest, timestamp_str, sort_us,
+                                      hostname, filepath)
+            if rec is not None:
+                records.append(rec)
+    return records
+
+
+def _parse_auth_files(filepaths, color_err):
+    """Parse one or more auth.log files. Returns list of records."""
+    all_records = []
+    for fpath in filepaths:
+        if not os.path.exists(fpath):
+            _msg(f"Error: File not found: {fpath}", "bold_red", color_err,
+                 file=sys.stderr)
+            continue
+        if not os.path.isfile(fpath):
+            _msg(f"Error: Not a regular file: {fpath}", "bold_red", color_err,
+                 file=sys.stderr)
+            continue
+        try:
+            recs = _parse_auth_file(fpath)
+            all_records.extend(recs)
+        except OSError as exc:
+            _msg(f"Error: Cannot read {fpath}: {exc}", "bold_red", color_err,
+                 file=sys.stderr)
+    return all_records
+
+
+# ---------------------------------------------------------------------------
+# Journal parsing (via journalctl subprocess)
+# ---------------------------------------------------------------------------
+
+def _parse_journal(dirpath, color_err):
+    """Parse a systemd journal directory via journalctl. Returns records."""
+    if not os.path.isdir(dirpath):
+        _msg(f"Error: Journal path is not a directory: {dirpath}",
+             "bold_red", color_err, file=sys.stderr)
+        return None
+
+    if not shutil.which("journalctl"):
+        _msg("Error: journalctl is not installed or not in PATH.\n"
+             "       journalctl is required to read binary journal files.",
+             "bold_red", color_err, file=sys.stderr)
+        return None
+
+    # Filter by SYSLOG_IDENTIFIER to avoid dumping the entire journal.
+    # The '+' acts as OR between filter groups in journalctl.
+    # Covers sshd (Ubuntu), sshd-session (Debian 13+), sudo, su, login,
+    # GDM/LightDM auth, and systemd-logind.
+    cmd = [
+        "journalctl",
+        f"--directory={dirpath}",
+        "--output=json",
+        "--no-pager",
+        "SYSLOG_IDENTIFIER=sshd",
+        "+", "SYSLOG_IDENTIFIER=sshd-session",
+        "+", "SYSLOG_IDENTIFIER=sudo",
+        "+", "SYSLOG_IDENTIFIER=su",
+        "+", "SYSLOG_IDENTIFIER=login",
+        "+", "SYSLOG_IDENTIFIER=systemd-logind",
+        "+", "SYSLOG_IDENTIFIER=gdm-password]",
+        "+", "SYSLOG_IDENTIFIER=gdm-session-worker",
+        "+", "SYSLOG_IDENTIFIER=lightdm",
+        "+", "SYSLOG_IDENTIFIER=polkitd",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        _msg(f"Error: Failed to run journalctl: {exc}", "bold_red", color_err,
+             file=sys.stderr)
+        return None
+
+    records = []
+    for line in proc.stdout:
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        rt_us_str = entry.get("__REALTIME_TIMESTAMP")
+        if not rt_us_str:
+            continue
+        try:
+            rt_us = int(rt_us_str)
+        except (ValueError, TypeError):
+            continue
+
+        timestamp_str = _format_timestamp_us(rt_us)
+        hostname = entry.get("_HOSTNAME", "")
+        message = entry.get("MESSAGE", "")
+        if not isinstance(message, str):
+            continue
+
+        svc_name = entry.get("SYSLOG_IDENTIFIER", entry.get("_COMM", ""))
+        pid = entry.get("_PID", "")
+
+        if svc_name == "sudo":
+            full_message = f"sudo: {message}"
+        elif pid:
+            full_message = f"{svc_name}[{pid}]: {message}"
+        else:
+            full_message = f"{svc_name}: {message}"
+
+        rec = _parse_auth_message(full_message, timestamp_str, rt_us,
+                                  hostname, dirpath)
+        if rec is not None:
+            records.append(rec)
+
+    stderr_out = proc.stderr.read()
+    proc.wait()
+
+    if proc.returncode != 0 and not records:
+        _msg(f"Error: journalctl exited with code {proc.returncode}.\n"
+             f"       {stderr_out.strip()}",
+             "bold_red", color_err, file=sys.stderr)
+        return None
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# File-type detection
+# ---------------------------------------------------------------------------
+
+def _detect_format(filepath, use_color):
+    """Return a format key (FMT_*) or None on error."""
+    if not os.path.exists(filepath):
+        _msg(f"Error: File not found: {filepath}", "bold_red", use_color,
+             file=sys.stderr)
+        return None
+
+    if not os.path.isfile(filepath):
+        _msg(f"Error: Not a regular file: {filepath}", "bold_red", use_color,
+             file=sys.stderr)
+        return None
+
+    is_gz = filepath.endswith(".gz")
+
+    if is_gz:
+        try:
+            with gzip.open(filepath, "rb") as f:
+                raw = f.read()
+        except (OSError, gzip.BadGzipFile) as exc:
+            _msg(f"Error: Cannot decompress {filepath}: {exc}",
+                 "bold_red", use_color, file=sys.stderr)
+            return None
+        file_size = len(raw)
+        header = raw[:max(16, UTMP_STRUCT_SIZE)]
+    else:
+        try:
+            file_size = os.path.getsize(filepath)
+        except OSError as exc:
+            _msg(f"Error: Cannot stat {filepath}: {exc}", "bold_red", use_color,
+                 file=sys.stderr)
+            return None
+
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(max(16, UTMP_STRUCT_SIZE))
+        except OSError as exc:
+            _msg(f"Error: Cannot read {filepath}: {exc}", "bold_red", use_color,
+                 file=sys.stderr)
+            return None
+
+    if file_size == 0:
+        basename = os.path.basename(filepath).lower()
+        if "btmp" in basename:
+            return FMT_LEGACY_BTMP
+        if "wtmp" in basename or "utmp" in basename:
+            return FMT_LEGACY_WTMP
+        _msg(f"Warning: {filepath} is empty and its type cannot be determined "
+             f"from the filename.",
+             "bold_yellow", use_color, file=sys.stderr)
+        return None
+
+    if not is_gz and len(header) >= 16 and header[:16] == SQLITE_MAGIC:
+        return _detect_wtmpdb(filepath, use_color)
+
+    if file_size < UTMP_STRUCT_SIZE:
+        _msg(f"Error: {filepath} is not a recognized wtmp, btmp, or utmp file.\n"
+             f"       File size ({file_size} bytes) is smaller than a single\n"
+             f"       utmp record ({UTMP_STRUCT_SIZE} bytes).",
+             "bold_red", use_color, file=sys.stderr)
+        return None
+
+    if len(header) >= 2:
+        first_type = struct.unpack("<h", header[:2])[0]
+        if first_type < 0 or first_type > 9:
+            _msg(f"Error: {filepath} does not appear to be a wtmp, btmp, or utmp "
+                 f"file.",
+                 "bold_red", use_color, file=sys.stderr)
+            return None
+
+    if file_size % UTMP_STRUCT_SIZE != 0:
+        remainder = file_size % UTMP_STRUCT_SIZE
+        complete = file_size // UTMP_STRUCT_SIZE
+        _msg(f"Warning: {filepath} has {remainder} trailing bytes after "
+             f"{complete} complete record(s). The file may be truncated.\n"
+             f"         Processing {complete} complete record(s).",
+             "bold_yellow", use_color, file=sys.stderr)
+
+    basename = os.path.basename(filepath).lower()
+    if "btmp" in basename:
+        return FMT_LEGACY_BTMP
+    if "wtmp" in basename or "utmp" in basename:
+        return FMT_LEGACY_WTMP
+
+    records = _parse_legacy_file(filepath)
+    type_set = {r["type"] for r in records}
+
+    if 2 in type_set or 8 in type_set:
+        return FMT_LEGACY_WTMP
+    if type_set.issubset({0, 5, 6, 7}):
+        return FMT_LEGACY_BTMP
+
+    return FMT_LEGACY_WTMP
+
+
+def _detect_wtmpdb(filepath, use_color):
+    """Validate a SQLite file as wtmpdb. Return FMT_WTMPDB or None."""
+    try:
+        conn = sqlite3.connect(f"file:{filepath}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+        conn.close()
+    except sqlite3.Error as exc:
+        _msg(f"Error: Cannot open SQLite database {filepath}: {exc}",
+             "bold_red", use_color, file=sys.stderr)
+        return None
+
+    if "wtmp" in tables:
+        return FMT_WTMPDB
+
+    _msg(f"Error: {filepath} is a SQLite database but does not contain a\n"
+         f"       'wtmp' table. It does not appear to be a wtmpdb file.",
+         "bold_red", use_color, file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Session matching (legacy wtmp only)
+# ---------------------------------------------------------------------------
+
+def _match_sessions(records):
+    """Walk records newest-first, pairing USER_PROCESS with logout events."""
+    sorted_recs = sorted(records, key=lambda r: (r["tv_sec"], r["tv_usec"]))
+
+    next_event = {}
+
+    for rec in reversed(sorted_recs):
+        rt = rec["type"]
+
+        if rt == 8:  # DEAD_PROCESS
+            next_event[rec["line"]] = (rec["tv_sec"], rec["tv_usec"], "")
+
+        elif rt == 2:  # BOOT_TIME
+            next_event.clear()
+            next_event["__BOOT__"] = (rec["tv_sec"], rec["tv_usec"], "down")
+
+        elif rt == 7:  # USER_PROCESS
+            line = rec["line"]
+            matched = False
+
+            if line in next_event:
+                sec, usec, label = next_event[line]
+                matched = True
+            elif "__BOOT__" in next_event:
+                sec, usec, label = next_event["__BOOT__"]
+                matched = True
+
+            if matched:
+                rec["logout_str"] = _format_timestamp(sec, usec)
+                if label:
+                    rec["logout_str"] += f" ({label})"
+                rec["duration_str"] = _format_duration(sec - rec["tv_sec"])
+            else:
+                rec["logout_str"] = "still logged in"
+                rec["duration_str"] = ""
+
+            next_event[line] = (rec["tv_sec"], rec["tv_usec"], "")
+
+    return sorted_recs
+
+
+# ---------------------------------------------------------------------------
+# Hashing
+# ---------------------------------------------------------------------------
+
+def _sha256(filepath):
+    """Return the SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_sources(source_paths):
+    """Compute SHA-256 for each source path. Returns {path: digest}."""
+    hashes = {}
+    for path in source_paths:
+        if os.path.isdir(path):
+            h = hashlib.sha256()
+            journal_files = sorted(
+                os.path.join(dirpath, fname)
+                for dirpath, _, filenames in os.walk(path)
+                for fname in filenames
+                if fname.endswith(".journal")
+            )
+            for jf in journal_files:
+                with open(jf, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+            hashes[path] = h.hexdigest()
+        elif os.path.isfile(path):
+            hashes[path] = _sha256(path)
+        else:
+            hashes[path] = ""
+    return hashes
+
+
+# ---------------------------------------------------------------------------
+# SQLite output (-s)
+# ---------------------------------------------------------------------------
+
+_PYLAST_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS pylast_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp         TEXT    NOT NULL,
+    type              TEXT    NOT NULL,
+    path              TEXT    NOT NULL,
+    action            TEXT    NOT NULL,
+    records           INTEGER NOT NULL,
+    pre_parse_sha256  TEXT    NOT NULL DEFAULT '',
+    post_parse_sha256 TEXT    NOT NULL DEFAULT ''
+)
+"""
+
+
+def _ensure_db(db_path, use_color):
+    """Open (or create) the SQLite database and return (conn, created_flag)."""
+    full_path = os.path.abspath(db_path)
+    created = not os.path.exists(full_path)
+
+    if created:
+        _msg(f"Database not found. Creating: {full_path}",
+             "bold_yellow", use_color)
+    else:
+        _msg(f"Database found: {full_path}", "bold_cyan", use_color)
+
+    conn = sqlite3.connect(full_path)
+    conn.execute(_PYLAST_LOG_DDL)
+    conn.commit()
+    return conn, full_path
+
+
+def _log_import(conn, fmt_key, source_paths, action, record_count,
+                pre_hashes=None, post_hashes=None):
+    """Write one row per source path to pylast_log with SHA-256 hashes."""
+    ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    type_label = FORMAT_TYPE_LABELS.get(fmt_key, fmt_key)
+    pre = pre_hashes or {}
+    post = post_hashes or {}
+    for path in source_paths:
+        conn.execute(
+            "INSERT INTO pylast_log "
+            "(timestamp, type, path, action, records, "
+            " pre_parse_sha256, post_parse_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, type_label, path, action, record_count,
+             pre.get(path, ""), post.get(path, "")),
+        )
+    conn.commit()
+
+
+def _prompt_table_action(table_name, use_color):
+    """Prompt the user to overwrite, append, or abort when the table exists."""
+    if not sys.stdin.isatty():
+        _msg(f"Table '{table_name}' already exists and stdin is not a TTY. "
+             "Aborting.", "bold_yellow", use_color)
+        return "aborted"
+
+    _msg(f"Table '{table_name}' already exists.", "bold_yellow", use_color)
+    print("  [o] Overwrite (drop and recreate)")
+    print("  [a] Append rows to existing table")
+    print("  [x] Abort")
+    while True:
+        try:
+            choice = input("\n  Choice [o/a/x]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "aborted"
+        if choice in ("o", "overwrite"):
+            return "refresh"
+        if choice in ("a", "append"):
+            return "append"
+        if choice in ("x", "abort"):
+            return "aborted"
+        print("  Please enter o, a, or x.")
+
+
+def _write_to_sqlite(db_path, records, fmt_key, source_paths, use_color):
+    """Write records to a SQLite database. Returns True on success."""
+    columns = FORMAT_COLUMNS[fmt_key]
+    table_name = FORMAT_TABLE_NAMES[fmt_key]
+
+    pre_hashes = _hash_sources(source_paths)
+
+    conn, full_path = _ensure_db(db_path, use_color)
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    )
+    table_exists = cursor.fetchone() is not None
+
+    if table_exists:
+        action = _prompt_table_action(table_name, use_color)
+        if action == "aborted":
+            _log_import(conn, fmt_key, source_paths, "aborted", 0,
+                        pre_hashes=pre_hashes, post_hashes=pre_hashes)
+            conn.close()
+            _msg("Import aborted. No records were written.",
+                 "bold_yellow", use_color)
+            return False
+        if action == "refresh":
+            conn.execute(f"DROP TABLE [{table_name}]")
+            conn.commit()
+    else:
+        action = "new"
+
+    col_defs = []
+    for header, key, _ in columns:
+        sql_type = "INTEGER" if key in INTEGER_RECORD_KEYS else "TEXT"
+        col_defs.append(f"  [{header}] {sql_type}")
+
+    create_sql = (
+        f"CREATE TABLE IF NOT EXISTS [{table_name}] (\n"
+        + ",\n".join(col_defs)
+        + "\n)"
+    )
+    conn.execute(create_sql)
+    conn.commit()
+
+    placeholders = ", ".join("?" for _ in columns)
+    insert_sql = (
+        f"INSERT INTO [{table_name}] "
+        f"({', '.join(f'[{h}]' for h, _, _ in columns)}) "
+        f"VALUES ({placeholders})"
+    )
+
+    row_count = 0
+    for rec in records:
+        values = []
+        for _, key, _ in columns:
+            val = rec.get(key, "")
+            if key in INTEGER_RECORD_KEYS:
+                try:
+                    val = int(val) if val != "" else None
+                except (ValueError, TypeError):
+                    val = None
+            else:
+                val = str(val) if val is not None else ""
+            values.append(val)
+        conn.execute(insert_sql, values)
+        row_count += 1
+
+    conn.commit()
+
+    post_hashes = _hash_sources(source_paths)
+    _log_import(conn, fmt_key, source_paths, action, row_count,
+                pre_hashes=pre_hashes, post_hashes=post_hashes)
+    conn.close()
+
+    _msg(f"Wrote {row_count} record(s) to table '{table_name}' in {full_path}",
+         "bold_green", use_color)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def _row_color(fmt_key, rec):
+    if fmt_key == FMT_LEGACY_BTMP:
+        return "red"
+    if fmt_key == FMT_LEGACY_WTMP:
+        return LEGACY_WTMP_TYPE_COLORS.get(rec["type"])
+    if fmt_key == FMT_WTMPDB:
+        return WTMPDB_TYPE_COLORS.get(rec["type"])
+    if fmt_key in (FMT_AUTH, FMT_JOURNAL):
+        return AUTH_EVENT_COLORS.get(rec.get("event"))
+    return None
+
+
+def _print_records(records, fmt_key, use_tsv, use_color):
+    if not records:
+        return
+
+    columns = FORMAT_COLUMNS[fmt_key]
+
+    if use_tsv:
+        print("\t".join(col[0] for col in columns))
+        for rec in records:
+            print("\t".join(str(rec.get(key, "")) for _, key, _ in columns))
+        return
+
+    widths = []
+    for header, key, min_w in columns:
+        w = max(len(header), min_w)
+        for rec in records:
+            w = max(w, len(str(rec.get(key, ""))))
+        widths.append(w)
+
+    hdr_parts = [h.ljust(w) for (h, _, _), w in zip(columns, widths, strict=True)]
+    print(_color("  ".join(hdr_parts), "bold", use_color))
+    print(_color("  ".join("\u2500" * w for w in widths), "gray", use_color))
+
+    for rec in records:
+        parts = [str(rec.get(key, "")).ljust(w) for (_, key, _), w in zip(columns, widths, strict=True)]
+        line = "  ".join(parts)
+        print(_color(line, _row_color(fmt_key, rec), use_color))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser():
+    parser = _Parser(
+        prog=PROG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action=_VersionAction,
+        help="show version information and exit",
+    )
+
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "-f",
+        "--file",
+        metavar="FILE",
+        nargs="+",
+        help="Parse wtmp, btmp, utmp, or wtmpdb file(s), including .gz "
+        "compressed. All files must be the same format and type.",
+    )
+    source.add_argument(
+        "-a",
+        "--auth",
+        metavar="FILE",
+        nargs="+",
+        help="Parse auth.log file(s). Supports plain text and .gz compressed "
+        "files. Shell wildcards work (e.g. auth.log*).",
+    )
+    source.add_argument(
+        "-j",
+        "--journal",
+        metavar="DIR",
+        help="Parse a systemd journal directory. Requires journalctl to be "
+        "installed on this system.",
+    )
+
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "-t",
+        action="store_true",
+        default=False,
+        help="Output as tab-separated values with a header row.",
+    )
+    output.add_argument(
+        "-s",
+        "--sqlite",
+        metavar="FILE",
+        help="Write results to a SQLite database instead of stdout.",
+    )
+
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        dest="show_all",
+        help="Show all record types when using -f. By default, only "
+        "USER_PROCESS, BOOT_TIME, and RUN_LVL are shown for wtmp/wtmpdb. "
+        "Has no effect with -a or -j.",
+    )
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _sort_key(fmt_key):
+    if fmt_key == FMT_WTMPDB:
+        return lambda r: r["login_us"]
+    if fmt_key in (FMT_AUTH, FMT_JOURNAL):
+        return lambda r: r["sort_us"]
+    return lambda r: (r["tv_sec"], r["tv_usec"])
+
+
+def _emit(records, fmt_key, args, source_paths, color_out):
+    """Output records to stdout or SQLite depending on flags."""
+    if args.sqlite:
+        ok = _write_to_sqlite(args.sqlite, records, fmt_key, source_paths,
+                              color_out)
+        if not ok:
+            sys.exit(1)
+    else:
+        _print_records(records, fmt_key, args.t, color_out)
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    color_out = sys.stdout.isatty()
+    color_err = sys.stderr.isatty()
+
+    # =======================================================================
+    # Mode: auth.log (-a)
+    # =======================================================================
+    if args.auth:
+        all_records = _parse_auth_files(args.auth, color_err)
+        if not all_records:
+            _msg("No login/auth events found in the provided file(s).",
+                 "bold_yellow", color_out)
+            sys.exit(0)
+        all_records.sort(key=_sort_key(FMT_AUTH), reverse=True)
+        _emit(all_records, FMT_AUTH, args,
+              [os.path.abspath(p) for p in args.auth], color_out)
+        return
+
+    # =======================================================================
+    # Mode: journal (-j)
+    # =======================================================================
+    if args.journal:
+        all_records = _parse_journal(args.journal, color_err)
+        if all_records is None:
+            sys.exit(1)
+        if not all_records:
+            _msg("No login/auth events found in the journal directory.",
+                 "bold_yellow", color_out)
+            sys.exit(0)
+        all_records.sort(key=_sort_key(FMT_JOURNAL), reverse=True)
+        _emit(all_records, FMT_JOURNAL, args,
+              [os.path.abspath(args.journal)], color_out)
+        return
+
+    # =======================================================================
+    # Mode: wtmp/btmp/utmp/wtmpdb (-f)
+    # =======================================================================
+    file_info = []
+    had_errors = False
+
+    for fpath in args.file:
+        fmt_key = _detect_format(fpath, color_err)
+        if fmt_key is None:
+            had_errors = True
+            continue
+        file_info.append((fpath, fmt_key))
+
+    if not file_info:
+        sys.exit(1 if had_errors else 0)
+
+    fmt_keys = {info[1] for info in file_info}
+    if len(fmt_keys) > 1:
+        detected = ", ".join(sorted(FORMAT_LABELS.get(k, k) for k in fmt_keys))
+        _msg(f"Error: Cannot mix different file types in the same execution.\n"
+             f"       Detected formats: {detected}\n"
+             f"       Please run {PROG} separately for each file type.",
+             "bold_red", color_err, file=sys.stderr)
+        sys.exit(1)
+
+    fmt_key = fmt_keys.pop()
+
+    all_records = []
+
+    for fpath, _ in file_info:
+        try:
+            if fmt_key == FMT_WTMPDB:
+                recs = _parse_wtmpdb_file(fpath)
+            else:
+                recs = _parse_legacy_file(fpath)
+        except (ValueError, OSError) as exc:
+            _msg(f"Error: {exc}", "bold_red", color_err, file=sys.stderr)
+            had_errors = True
+            continue
+
+        for r in recs:
+            r["source"] = fpath
+        all_records.extend(recs)
+
+    if not all_records:
+        _msg("No records found in the provided file(s).", "bold_yellow", color_out)
+        sys.exit(0)
+
+    if fmt_key == FMT_LEGACY_WTMP:
+        all_records = _match_sessions(all_records)
+
+    if not args.show_all:
+        if fmt_key == FMT_LEGACY_WTMP:
+            all_records = [r for r in all_records if r["type"] in LEGACY_WTMP_DEFAULT_TYPES]
+        elif fmt_key == FMT_WTMPDB:
+            all_records = [r for r in all_records if r["type"] in WTMPDB_DEFAULT_TYPES]
+
+    if not all_records:
+        msg = "No matching records found."
+        if fmt_key in (FMT_LEGACY_WTMP, FMT_WTMPDB):
+            msg += " Try --all to show all record types."
+        _msg(msg, "bold_yellow", color_out)
+        sys.exit(0)
+
+    all_records.sort(key=_sort_key(fmt_key), reverse=True)
+    _emit(all_records, fmt_key, args,
+          [os.path.abspath(fpath) for fpath, _ in file_info],
+          color_out)
+
+
+if __name__ == "__main__":
+    main()
